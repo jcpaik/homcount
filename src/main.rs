@@ -5,18 +5,18 @@ use ndarray::prelude::*;
 use rug::Integer;
 
 fn main() {
-    // 1. Initialize Tensors with dummy data
+    // 1. Initialize Tensors with dummy data using ArrayD (dynamic dimensions)
     // Tensor A: 3 x 4 x 5 x 6
-    let a: Array4<Integer> = Array::from_elem((3, 4, 5, 6), Integer::from(1));
+    let a: ArrayD<Integer> = ArrayD::from_elem(IxDyn(&[3, 4, 5, 6]), Integer::from(1));
 
     // Tensor B: 7 x 8 x 3 x 5
-    let b: Array4<Integer> = Array::from_elem((7, 8, 3, 5), Integer::from(2));
+    let b: ArrayD<Integer> = ArrayD::from_elem(IxDyn(&[7, 8, 3, 5]), Integer::from(2));
 
     // 2. Prepare Tensor A (Left side of multiplication)
     // We want Output dims (4, 6) first, then Contracting dims (3, 5)
     // Current indices: 0=3, 1=4, 2=5, 3=6.
     // Permutation order: 1, 3, 0, 2
-    let a_permuted = a.permuted_axes([1, 3, 0, 2]);
+    let a_permuted = a.permuted_axes(IxDyn(&[1, 3, 0, 2]));
 
     // Make it contiguous in memory to allow reshaping without copying later if possible,
     // though reshaping usually requires standard layout.
@@ -29,7 +29,7 @@ fn main() {
     // We want Contracting dims (3, 5) first, then Output dims (7, 8)
     // Current indices: 0=7, 1=8, 2=3, 3=5.
     // Permutation order: 2, 3, 0, 1
-    let b_permuted = b.permuted_axes([2, 3, 0, 1]);
+    let b_permuted = b.permuted_axes(IxDyn(&[2, 3, 0, 1]));
     let b_std = b_permuted.as_standard_layout();
 
     // Reshape to Matrix: (3*5) x (7*8) -> 15 x 56
@@ -49,7 +49,7 @@ fn main() {
                 let mut sum = Integer::new(); // Start with zero
 
                 // Compute dot product manually: sum of a_row[k] * b_matrix[k][col_idx]
-                for (k, &ref a_val) in a_row.indexed_iter() {
+                for (k, a_val) in a_row.indexed_iter() {
                     let b_val = &b_matrix[[k, col_idx]];
                     sum += a_val * b_val;
                 }
@@ -59,12 +59,12 @@ fn main() {
         });
 
     // 6. Reshape to Target Dimensions: 4 x 6 x 7 x 8
-    let final_tensor = result_matrix.to_shape((4, 6, 7, 8)).unwrap();
+    let final_tensor = result_matrix.to_shape(IxDyn(&[4, 6, 7, 8])).unwrap();
 
     println!("Success!");
     println!("Final Shape: {:?}", final_tensor.shape());
 
-    // Verification: (3*5) elements summed. 1.0 * 2.0 = 2.0 per element.
-    // Sum should be 15 * 2.0 = 30.0
+    // Verification: (3*5) elements summed. 1 * 2 = 2 per element.
+    // Sum should be 15 * 2 = 30
     println!("First element value: {}", final_tensor[[0, 0, 0, 0]]);
 }
