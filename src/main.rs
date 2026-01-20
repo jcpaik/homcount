@@ -4,6 +4,56 @@ use ndarray::Zip;
 use ndarray::prelude::*;
 use rug::Integer;
 
+/// Performs batched matrix multiplication of two 3D tensors.
+///
+/// Given tensor A of shape (B x N x M) and tensor B of shape (B x M x K),
+/// computes the batched matrix product resulting in a tensor of shape (B x N x K).
+///
+/// For each batch index b:
+///   result[b, i, j] = sum over m of A[b, i, m] * B[b, m, j]
+fn batched_matmul(
+    a: &ArrayView3<Integer>,
+    b: &ArrayView3<Integer>,
+) -> Array3<Integer> {
+    let batch_size = a.shape()[0];
+    let n = a.shape()[1];
+    let m = a.shape()[2];
+    let k = b.shape()[2];
+
+    assert_eq!(b.shape()[0], batch_size, "Batch dimensions must match");
+    assert_eq!(b.shape()[1], m, "Inner dimensions must match: A is B x N x M, B must be B x M x K");
+
+    // Prepare output container: B x N x K
+    let result = Array3::from_elem((batch_size, n, k), Integer::from(0));
+
+    // Flatten batch and row dimensions for parallel iteration: (B * N) rows total
+    let a_flat = a.to_shape((batch_size * n, m)).unwrap();
+    let mut result_flat = result.into_shape_with_order((batch_size * n, k)).unwrap();
+
+    Zip::indexed(result_flat.rows_mut())
+        .and(a_flat.rows())
+        .par_for_each(|idx, mut res_row, a_row| {
+            // Determine which batch this row belongs to
+            let batch_idx = idx / n;
+
+            // Manual matrix multiplication: compute each element of result row
+            for (col_idx, res_elem) in res_row.indexed_iter_mut() {
+                let mut sum = Integer::new();
+
+                // Compute dot product: sum of a_row[m] * b[batch_idx, m, col_idx]
+                for (m_idx, a_val) in a_row.indexed_iter() {
+                    let b_val = &b[[batch_idx, m_idx, col_idx]];
+                    sum += a_val * b_val;
+                }
+
+                *res_elem = sum;
+            }
+        });
+
+    // Reshape back to 3D
+    result_flat.into_shape_with_order((batch_size, n, k)).unwrap()
+}
+
 fn main() {
     // 1. Initialize Tensors with dummy data using ArrayD (dynamic dimensions)
     // Tensor A: 3 x 4 x 5 x 6 x 9
@@ -33,45 +83,14 @@ fn main() {
     // Reshape to 3D: 9 x (3*5) x (7*8) = 9 x 15 x 56
     let b_batched = b_std.to_shape((9, 15, 56)).unwrap();
 
-    // 4. Prepare Output Container
-    // Result of batched (9 x 24 x 15) * (9 x 15 x 56) is (9 x 24 x 56)
-    let result_batched = Array3::from_elem((9, 24, 56), Integer::from(0));
+    // 4. Perform Parallel Batched Matrix Multiplication
+    // (9 x 24 x 15) * (9 x 15 x 56) -> (9 x 24 x 56)
+    let result_batched = batched_matmul(&a_batched.view(), &b_batched.view());
 
-    // 5. Perform Parallel Batched Matrix Multiplication
-    // Zip over (batch, row) pairs by zipping over the 2D array of rows across all batches
-    // Flatten batch and row dimensions for parallel iteration: (9*24) rows total
-    let a_flat = a_batched.to_shape((9 * 24, 15)).unwrap();
-
-    // Reshape result_batched in place using into_shape_with_order
-    let mut result_flat = result_batched.into_shape_with_order((9 * 24, 56)).unwrap();
-
-    Zip::indexed(result_flat.rows_mut())
-        .and(a_flat.rows())
-        .par_for_each(|idx, mut res_row, a_row| {
-            // Determine which batch this row belongs to
-            let batch_idx = idx / 24;
-
-            // Manual matrix multiplication: compute each element of result row
-            for (col_idx, res_elem) in res_row.indexed_iter_mut() {
-                let mut sum = Integer::new();
-
-                // Compute dot product: sum of a_row[k] * b_batched[batch_idx, k, col_idx]
-                for (k, a_val) in a_row.indexed_iter() {
-                    let b_val = &b_batched[[batch_idx, k, col_idx]];
-                    sum += a_val * b_val;
-                }
-
-                *res_elem = sum;
-            }
-        });
-
-    // Reshape back to 3D for further processing
-    let result_batched = result_flat.into_shape_with_order((9, 24, 56)).unwrap();
-
-    // 6. Reshape result: 9 x 24 x 56 -> 9 x 4 x 6 x 7 x 8
+    // 5. Reshape result: 9 x 24 x 56 -> 9 x 4 x 6 x 7 x 8
     let result_5d = result_batched.to_shape((9, 4, 6, 7, 8)).unwrap();
 
-    // 7. Permute to final shape: 4 x 6 x 7 x 8 x 9
+    // 6. Permute to final shape: 4 x 6 x 7 x 8 x 9
     // Current indices: 0=9, 1=4, 2=6, 3=7, 4=8
     // Want: 4 x 6 x 7 x 8 x 9
     // Permutation: [1, 2, 3, 4, 0]
