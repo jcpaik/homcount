@@ -54,8 +54,129 @@ fn batched_matmul(
     result_flat.into_shape_with_order((batch_size, n, k)).unwrap()
 }
 
+/// Performs tensor contraction with batched and contracted axes.
+///
+/// # Arguments
+/// * `a` - First input tensor
+/// * `b` - Second input tensor
+/// * `batch_axes` - Pairs of axis indices (a_axis, b_axis) that are batched over (multiplied element-wise, not summed)
+/// * `contract_axes` - Pairs of axis indices (a_axis, b_axis) that are contracted (summed over, like matrix multiplication)
+///
+/// # Returns
+/// Result tensor with shape: [a_output_dims..., b_output_dims..., batch_dims...]
+/// where output dims are the axes not in batch or contract.
+fn tensor_contract(
+    a: &ArrayD<Integer>,
+    b: &ArrayD<Integer>,
+    batch_axes: &[(usize, usize)],
+    contract_axes: &[(usize, usize)],
+) -> ArrayD<Integer> {
+    // Extract axis indices for A and B
+    let a_batch_axes: Vec<usize> = batch_axes.iter().map(|(ai, _)| *ai).collect();
+    let a_contract_axes: Vec<usize> = contract_axes.iter().map(|(ai, _)| *ai).collect();
+
+    let b_batch_axes: Vec<usize> = batch_axes.iter().map(|(_, bi)| *bi).collect();
+    let b_contract_axes: Vec<usize> = contract_axes.iter().map(|(_, bi)| *bi).collect();
+
+    // Find output axes (axes not in batch or contract)
+    let a_ndim = a.ndim();
+    let b_ndim = b.ndim();
+
+    let a_output_axes: Vec<usize> = (0..a_ndim)
+        .filter(|i| !a_batch_axes.contains(i) && !a_contract_axes.contains(i))
+        .collect();
+
+    let b_output_axes: Vec<usize> = (0..b_ndim)
+        .filter(|i| !b_batch_axes.contains(i) && !b_contract_axes.contains(i))
+        .collect();
+
+    // Compute dimension sizes
+    let batch_size: usize = a_batch_axes.iter().map(|&i| a.shape()[i]).product::<usize>().max(1);
+    let a_output_size: usize = a_output_axes.iter().map(|&i| a.shape()[i]).product::<usize>().max(1);
+    let contract_size: usize = a_contract_axes.iter().map(|&i| a.shape()[i]).product::<usize>().max(1);
+    let b_output_size: usize = b_output_axes.iter().map(|&i| b.shape()[i]).product::<usize>().max(1);
+
+    // Build permutation for A: [batch_axes, output_axes, contract_axes]
+    let a_perm: Vec<usize> = a_batch_axes
+        .iter()
+        .chain(a_output_axes.iter())
+        .chain(a_contract_axes.iter())
+        .copied()
+        .collect();
+
+    // Build permutation for B: [batch_axes, contract_axes, output_axes]
+    let b_perm: Vec<usize> = b_batch_axes
+        .iter()
+        .chain(b_contract_axes.iter())
+        .chain(b_output_axes.iter())
+        .copied()
+        .collect();
+
+    // Permute and reshape A to 3D: (batch, a_output, contract)
+    let a_permuted = a.view().permuted_axes(IxDyn(&a_perm));
+    let a_std = a_permuted.as_standard_layout();
+    let a_3d = a_std
+        .to_shape((batch_size, a_output_size, contract_size))
+        .unwrap();
+
+    // Permute and reshape B to 3D: (batch, contract, b_output)
+    let b_permuted = b.view().permuted_axes(IxDyn(&b_perm));
+    let b_std = b_permuted.as_standard_layout();
+    let b_3d = b_std
+        .to_shape((batch_size, contract_size, b_output_size))
+        .unwrap();
+
+    // Convert to Array3 views for batched_matmul
+    let a_view: ArrayView3<Integer> = a_3d.view().into_dimensionality().unwrap();
+    let b_view: ArrayView3<Integer> = b_3d.view().into_dimensionality().unwrap();
+
+    // Batched matrix multiplication: (batch, a_output, contract) x (batch, contract, b_output) -> (batch, a_output, b_output)
+    let result_3d = batched_matmul(&a_view, &b_view);
+
+    // Build expanded shape: [batch_dims..., a_output_dims..., b_output_dims...]
+    let mut expanded_shape: Vec<usize> = Vec::new();
+    for &i in &a_batch_axes {
+        expanded_shape.push(a.shape()[i]);
+    }
+    for &i in &a_output_axes {
+        expanded_shape.push(a.shape()[i]);
+    }
+    for &i in &b_output_axes {
+        expanded_shape.push(b.shape()[i]);
+    }
+
+    // Reshape result to expanded dimensions
+    let result_expanded = result_3d
+        .into_shape_with_order(IxDyn(&expanded_shape))
+        .unwrap();
+
+    // Permute to final order: [a_output_dims, b_output_dims, batch_dims]
+    let n_batch = a_batch_axes.len();
+    let n_a_out = a_output_axes.len();
+    let n_b_out = b_output_axes.len();
+
+    // Build final permutation
+    let mut final_perm: Vec<usize> = Vec::new();
+    // a_output_dims first
+    for i in 0..n_a_out {
+        final_perm.push(n_batch + i);
+    }
+    // b_output_dims next
+    for i in 0..n_b_out {
+        final_perm.push(n_batch + n_a_out + i);
+    }
+    // batch_dims last
+    for i in 0..n_batch {
+        final_perm.push(i);
+    }
+
+    result_expanded
+        .permuted_axes(IxDyn(&final_perm))
+        .into_owned()
+}
+
 fn main() {
-    // 1. Initialize Tensors with dummy data using ArrayD (dynamic dimensions)
+    // Initialize Tensors with dummy data
     // Tensor A: 3 x 4 x 5 x 6 x 9
     let a: ArrayD<Integer> = ArrayD::from_elem(IxDyn(&[3, 4, 5, 6, 9]), Integer::from(1));
 
@@ -63,38 +184,14 @@ fn main() {
     let b: ArrayD<Integer> = ArrayD::from_elem(IxDyn(&[9, 7, 8, 3, 5]), Integer::from(2));
 
     // Operation: result[i4, i6, i7, i8, k] = sum over (i3, i5) of A[i3, i4, i5, i6, k] * B[k, i7, i8, i3, i5]
-    // The 9-dimension is multiplied along but NOT aggregated (batched matrix multiplication).
+    //
+    // batch_axes: [(4, 0)] - axis 4 of A (size 9) batched with axis 0 of B (size 9)
+    // contract_axes: [(0, 3), (2, 4)] - axis 0 of A (size 3) contracted with axis 3 of B (size 3),
+    //                                   axis 2 of A (size 5) contracted with axis 4 of B (size 5)
+    let batch_axes = vec![(4, 0)];
+    let contract_axes = vec![(0, 3), (2, 4)];
 
-    // 2. Prepare Tensor A (Left side of multiplication)
-    // Current indices: 0=3, 1=4, 2=5, 3=6, 4=9
-    // Want: 9 x 4 x 6 x 3 x 5 (batch, output_A, contract)
-    // Permutation: [4, 1, 3, 0, 2]
-    let a_permuted = a.permuted_axes(IxDyn(&[4, 1, 3, 0, 2]));
-    let a_std = a_permuted.as_standard_layout();
-    // Reshape to 3D: 9 x (4*6) x (3*5) = 9 x 24 x 15
-    let a_batched = a_std.to_shape((9, 24, 15)).unwrap();
-
-    // 3. Prepare Tensor B (Right side of multiplication)
-    // Current indices: 0=9, 1=7, 2=8, 3=3, 4=5
-    // Want: 9 x 3 x 5 x 7 x 8 (batch, contract, output_B)
-    // Permutation: [0, 3, 4, 1, 2]
-    let b_permuted = b.permuted_axes(IxDyn(&[0, 3, 4, 1, 2]));
-    let b_std = b_permuted.as_standard_layout();
-    // Reshape to 3D: 9 x (3*5) x (7*8) = 9 x 15 x 56
-    let b_batched = b_std.to_shape((9, 15, 56)).unwrap();
-
-    // 4. Perform Parallel Batched Matrix Multiplication
-    // (9 x 24 x 15) * (9 x 15 x 56) -> (9 x 24 x 56)
-    let result_batched = batched_matmul(&a_batched.view(), &b_batched.view());
-
-    // 5. Reshape result: 9 x 24 x 56 -> 9 x 4 x 6 x 7 x 8
-    let result_5d = result_batched.to_shape((9, 4, 6, 7, 8)).unwrap();
-
-    // 6. Permute to final shape: 4 x 6 x 7 x 8 x 9
-    // Current indices: 0=9, 1=4, 2=6, 3=7, 4=8
-    // Want: 4 x 6 x 7 x 8 x 9
-    // Permutation: [1, 2, 3, 4, 0]
-    let final_tensor = result_5d.permuted_axes([1, 2, 3, 4, 0]);
+    let final_tensor = tensor_contract(&a, &b, &batch_axes, &contract_axes);
 
     println!("Success!");
     println!("Final Shape: {:?}", final_tensor.shape());
